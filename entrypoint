@@ -1,0 +1,104 @@
+#!/bin/bash
+
+function validate(){
+    vars="RANCHER_URL RANCHER_ACCESS_KEY RANCHER_SECRET_KEY DOMAIN"
+    for var in $vars; do
+        if [[ $(env | awk -F "=" '{print $1}' | grep "^$var$") != "$var" ]]; then
+            echo "$var not set but required."
+            return 1
+        fi
+    done
+}
+
+function createCertificates(){
+    echo "certbot for domain $DOMAIN"
+    domainlist="$DOMAIN"
+    if [[ "$SECONDARYDOMAINS" != "" ]]; then
+	    for dom in $SECONDARYDOMAINS ; do
+		domainlist="$domainlist -d $dom"
+	    done
+    fi
+    certbot certonly \
+	--keep \
+	--expand \
+	--webroot \
+	--register-unsafely-without-email \
+	--agree-tos \
+	-w /var/lib/webroot \
+	-d $domainlist
+    if [[ $? != 0 ]]; then 
+        echo "certbot exit code: error"
+        return 1
+    else
+        return 0
+    fi		
+}
+
+function updateRancherCertificates(){
+    updateUrl=$(curl -s -X GET -u "${RANCHER_ACCESS_KEY}:${RANCHER_SECRET_KEY}" $RANCHER_URL/v1/certificates | jq -r ".data[] | select(.CN==\"$DOMAIN\") | .actions.update")
+    method="PUT"
+    echo "updateUrl: >$updateUrl<"
+    if [[ "${updateUrl}" == "" ]]; then
+        echo "create new cert"
+        updateUrl="$RANCHER_URL/v1/certificates"
+        method="POST"
+    fi
+
+    # send cert to rancher
+    cert=$(sed -E ':a;N;$!ba;s/\r{0,1}\n/\\n/g' /etc/letsencrypt/live/$DOMAIN/cert.pem)
+    certChain=$(sed -E ':a;N;$!ba;s/\r{0,1}\n/\\n/g' /etc/letsencrypt/live/$DOMAIN/chain.pem)
+    key=$(sed -E ':a;N;$!ba;s/\r{0,1}\n/\\n/g' /etc/letsencrypt/live/$DOMAIN/privkey.pem)
+    data="{ \"cert\":\"$cert\",
+            \"certChain\":\"$certChain\",
+            \"description\":\"letsencrypt cert\",
+            \"key\":\"$key\",
+            \"name\":\"certbot $DOMAIN\"    
+            }"
+    echo "send cert to $updateUrl"
+    result=$(curl -s -X $method -H 'Accept: application/json' -H 'Content-Type: application/json'  \
+        -u "${RANCHER_ACCESS_KEY}:${RANCHER_SECRET_KEY}" \
+        -d "$data" \
+        $updateUrl | jq -r '.state')
+    if [[ ${token[0]} == "null" ]]; then
+        echo "state for new cert is null."
+        return 1
+    else
+        return 0
+    fi
+}
+
+function main(){
+    # validate env vars
+    if [[ "$1" != "certonly" ]]; then    
+	    validate
+	    if [[ $? != 0 ]]; then 
+		echo "validation failed. exiting now." >&2
+		exit 1
+	    fi
+    fi
+
+    # create certificates with certbot
+    createCertificates
+    if [[ $? != 0 ]]; then 
+        echo "certbot certonly failed. exiting now." >&2
+        exit 1
+    fi
+        
+    # update certificates in rancher server
+    if [[ "$1" != "certonly" ]]; then    
+	    updateRancherCertificates
+	    if [[ $? != 0 ]]; then 
+		echo "rancher certificates update failed. exiting now." >&2
+		exit 1
+	    fi
+    fi    
+}
+
+
+if [[ "$1" == "" ]]; then
+    main
+elif [[ "$1" == "certonly" ]]; then
+    main "$1"
+else
+    exec "$@"
+fi
